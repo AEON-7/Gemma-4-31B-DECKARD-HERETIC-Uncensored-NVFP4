@@ -20,7 +20,7 @@ Two quantization variants are available on HuggingFace:
 A pre-built vLLM container compiled for NVIDIA DGX Spark (GB10, SM 12.1) is available with all required patches:
 
 ```bash
-docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
+docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest
 ```
 
 **Image contents:**
@@ -28,17 +28,19 @@ docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
 - PyTorch 2.12.0 + CUDA 13.0
 - transformers 5.5.0
 - FlashInfer 0.6.7
-- **Patched `modelopt.py`** — fixes FP8 NaN in weight scales + adds NVFP4_AWQ support + W4A16 emulation bypass
+- **Patched `modelopt.py`** — fixes FP8 NaN in weight scales + adds NVFP4_AWQ support + W4A16 emulation bypass (only activates on EMULATION backend)
 - Built from [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) with `--tf5` flag
 
-> [Container on GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4) | Compatible with both the MoE and Dense DECKARD models
+> [AWQ Container on GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4-awq) | For AWQ_FULL quantized models
+>
+> The original non-AWQ container is still available: `docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest`
 
 ### Container Tags
 
 | Tag | Description |
 |---|---|
-| `latest` | Current patched build (v2) with NVFP4_AWQ fixes |
-| `v2-nvfp4-awq` | Same as latest — explicit version tag |
+| `latest` | Current patched build with NVFP4_AWQ fixes |
+| `v1` | Same as latest — explicit version tag |
 
 ## Critical Fix: FP8 NaN in Weight Scales
 
@@ -72,7 +74,7 @@ If you're **not** using the pre-built container, you must apply the [`modelopt_p
 ```yaml
 services:
   vllm:
-    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
+    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest
     container_name: vllm-deckard-31b
     restart: unless-stopped
     network_mode: host
@@ -121,7 +123,7 @@ services:
 ```yaml
 services:
   vllm:
-    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
+    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest
     container_name: vllm-deckard-31b
     restart: unless-stopped
     network_mode: host
@@ -303,7 +305,8 @@ Each quantized layer stores:
 
 | Resource | Description | Link |
 |---|---|---|
-| **vLLM Container** | Pre-built for DGX Spark SM 12.1, patched for NVFP4_AWQ | [GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4) |
+| **vLLM AWQ Container** | Patched for NVFP4_AWQ (FP8 NaN fix + W4A16 bypass) | [GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4-awq) |
+| **vLLM Base Container** | Pre-built for DGX Spark SM 12.1 (non-AWQ models) | [GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4) |
 | **Build System** | spark-vllm-docker (compile vLLM from source) | [GitHub](https://github.com/eugr/spark-vllm-docker) |
 | **Base Model** | DECKARD HERETIC (BF16) | [HuggingFace](https://huggingface.co/DavidAU/gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking) |
 
