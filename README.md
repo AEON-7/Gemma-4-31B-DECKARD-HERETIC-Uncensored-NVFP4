@@ -28,19 +28,19 @@ docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest
 - PyTorch 2.12.0 + CUDA 13.0
 - transformers 5.5.0
 - FlashInfer 0.6.7
-- **Patched `modelopt.py`** — fixes FP8 NaN in weight scales + adds NVFP4_AWQ support + W4A16 emulation bypass (only activates on EMULATION backend)
+- **Patched `modelopt.py`** — fixes FP8 NaN in weight scales, adds NVFP4_AWQ support, AWQ pre_quant_scale handling
 - Built from [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) with `--tf5` flag
 
 > [AWQ Container on GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4-awq) | For AWQ_FULL quantized models
 >
-> The original non-AWQ container is still available: `docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest`
+> The original non-AWQ container is also available: `docker pull ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest`
 
 ### Container Tags
 
 | Tag | Description |
 |---|---|
-| `latest` | Current patched build with NVFP4_AWQ fixes |
-| `v1` | Same as latest — explicit version tag |
+| `latest` | Current patched build (v2) with NVFP4_AWQ fixes |
+| `v2` | Same as latest — explicit version tag |
 
 ## Critical Fix: FP8 NaN in Weight Scales
 
@@ -51,6 +51,21 @@ The NVFP4 checkpoint produced by ModelOpt 0.42.0 contains **scattered FP8 NaN va
 **Fix**: The patched container automatically scrubs FP8 NaN values to zero at model load time, zeroing out the affected blocks (60 out of ~280 million scale elements — negligible quality impact).
 
 If you're **not** using the pre-built container, you must apply the [`modelopt_patched.py`](modelopt_patched.py) patch. See [Manual Patching](#manual-patching) below.
+
+## Performance (DGX Spark GB10)
+
+Benchmarked with `ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest` on NVIDIA DGX Spark (GB10, SM 12.1, 128 GB unified memory). Native FP4 via FLASHINFER_CUTLASS backend. **Zero failures** across all concurrency levels.
+
+| Concurrent | Aggregate tok/s | Per-Request tok/s | Avg Latency (200 tok) |
+|---:|---:|---:|---:|
+| 1 | 11 | 11 | 18.8s |
+| 2 | 22 | 11 | 18.1s |
+| 4 | 43 | 11 | 18.4s |
+| 8 | 84 | 11 | 19.0s |
+| 16 | 161 | 10 | 19.8s |
+| 32 | 162 | 8 | 29.6s |
+
+Throughput scales linearly up to 16 concurrent requests (161 aggregate tok/s), saturating at 32.
 
 ## Model Details
 
@@ -81,19 +96,15 @@ services:
     volumes:
       - /path/to/model:/models/deckard
     environment:
-      - VLLM_NVFP4_GEMM_BACKEND=emulation
       - VLLM_TEST_FORCE_FP8_MARLIN=1
       - VLLM_MARLIN_USE_ATOMIC_ADD=1
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-      - TORCH_MATMUL_PRECISION=high
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      - NVIDIA_FORWARD_COMPAT=1
     command:
       - bash
       - -c
       - |
         exec vllm serve /models/deckard \
-          --served-model-name deckard \
+          --served-model-name deckard-31b \
           --quantization modelopt \
           --dtype auto \
           --kv-cache-dtype auto \
@@ -102,7 +113,6 @@ services:
           --max-num-seqs 16 \
           --gpu-memory-utilization 0.85 \
           --trust-remote-code \
-          --enforce-eager \
           --enable-chunked-prefill \
           --enable-prefix-caching \
           --enable-auto-tool-choice \
@@ -138,7 +148,7 @@ services:
       - -c
       - |
         exec vllm serve /models/deckard \
-          --served-model-name deckard \
+          --served-model-name deckard-31b \
           --quantization modelopt \
           --dtype auto \
           --kv-cache-dtype fp8 \
@@ -162,27 +172,21 @@ services:
 
 ### Key Deployment Flags
 
-| Flag | Purpose | When Required |
-|---|---|---|
-| `--quantization modelopt` | Use NVIDIA ModelOpt NVFP4 format | Always |
-| `--enforce-eager` | Disable torch.compile (avoids dynamo errors in emulation) | DGX Spark / emulation backend |
-| `--kv-cache-dtype auto` | Let vLLM choose KV cache dtype | DGX Spark (use `fp8` on B200) |
-| `--max-model-len 4096` | Conservative context for 128 GB unified memory | DGX Spark (use 131072 on B200) |
-| `--reasoning-parser gemma4` | Extracts `<think>` blocks for reasoning display | Optional |
-| `--tool-call-parser gemma4` | Enables native Gemma 4 function calling | Optional |
-| `--enable-chunked-prefill` | Processes long prompts in chunks to avoid OOM | Recommended |
-| `--enable-prefix-caching` | Caches common prompt prefixes for faster responses | Recommended |
+| Flag | Purpose |
+|---|---|
+| `--quantization modelopt` | **Required** — tells vLLM to use NVIDIA ModelOpt NVFP4 format |
+| `--kv-cache-dtype auto` | Let vLLM choose KV cache dtype (use `fp8` on B200 for 2x compression) |
+| `--max-model-len 4096` | Conservative context for 128 GB unified memory (use 131072 on B200) |
+| `--reasoning-parser gemma4` | Extracts `<think>` blocks for thinking/reasoning display |
+| `--tool-call-parser gemma4` | Enables native Gemma 4 function calling |
+| `--enable-chunked-prefill` | Processes long prompts in chunks to avoid OOM |
+| `--enable-prefix-caching` | Caches common prompt prefixes for faster responses |
 
-### Environment Variables
+### NVFP4 Backend Selection
 
-| Variable | Value | Purpose |
-|---|---|---|
-| `VLLM_NVFP4_GEMM_BACKEND` | `emulation` | **Required on DGX Spark** — uses W4A16 dequant bypass (no fbgemm_gpu) |
-| `VLLM_TEST_FORCE_FP8_MARLIN` | `1` | Force FP8 Marlin kernel selection |
-| `VLLM_MARLIN_USE_ATOMIC_ADD` | `1` | Enable atomic operations for Marlin |
-| `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | `1` | Allow context lengths above default |
-| `TORCH_MATMUL_PRECISION` | `high` | Higher precision matrix multiply |
-| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Better CUDA memory allocation |
+vLLM auto-selects the best FP4 backend for your hardware. On DGX Spark, it selects **FLASHINFER_CUTLASS** which uses native FP4 GEMM kernels. You do **not** need to set `VLLM_NVFP4_GEMM_BACKEND` — auto-selection works correctly.
+
+If your system lacks a supported backend, vLLM falls back to the EMULATION backend. The patched `modelopt.py` provides a W4A16 bypass for emulation (dequantizes weights to BF16, keeps activations at full precision) rather than the default W4A4 emulation. If using emulation, add `--enforce-eager` and set `VLLM_NVFP4_GEMM_BACKEND=emulation`.
 
 ## Manual Patching
 
@@ -198,14 +202,6 @@ cp modelopt_patched.py \
   $(python3 -c "import vllm; print(vllm.__path__[0])")/model_executor/layers/quantization/modelopt.py
 ```
 
-Or mount it as a volume:
-
-```bash
-docker run ... \
-  -v ./modelopt_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/modelopt.py \
-  ...
-```
-
 ### What the Patch Fixes
 
 1. **FP8 NaN Scrubbing** — Detects and replaces FP8 E4M3 NaN values (0x7F/0xFF) in `weight_scale` tensors at load time. ModelOpt 0.42.0 produces ~60 NaN values across 39 layers.
@@ -214,7 +210,7 @@ docker run ... \
 
 3. **AWQ Pre-Quant Scale** — Registers, loads, and applies per-channel `pre_quant_scale` tensors that AWQ uses to redistribute weight magnitudes before quantization. Without this, activations are not properly scaled for the quantized weights.
 
-4. **W4A16 Emulation Bypass** — On the EMULATION backend (DGX Spark), the standard code path quantizes *both* inputs and weights to FP4 (W4A4). The patch bypasses input quantization and only dequantizes weights, performing the matmul in BF16 (W4A16). This avoids the aggressive quality loss from FP4 input quantization.
+4. **W4A16 Emulation Fallback** — On the EMULATION backend only, bypasses input FP4 quantization and performs a W4A16 matmul (dequant weights to BF16, keep activations at full precision). All other backends use the standard hardware-accelerated path.
 
 ## Quantization Pipeline
 
@@ -246,36 +242,16 @@ Gemma 4 31B DECKARD HERETIC (BF16, ~62 GB)
 
 All variants were quantized on NVIDIA B200 with native FP4 hardware instructions (SM 12.0). The calibration measures actual FP4 rounding behavior on real Blackwell hardware rather than simulating it, producing more accurate scale factors than calibrating on non-FP4 GPUs.
 
-## Performance Expectations
-
-### DGX Spark (W4A16 Emulation)
-
-| Configuration | Estimated tok/s |
-|---|---|
-| BF16 (no quantization) | ~3-5 |
-| NVFP4 AWQ_FULL (W4A16 bypass) | ~8-12 |
-| NVFP4 SVDQuant (W4A16 bypass) | ~7-10 |
-
-> Note: DGX Spark uses W4A16 emulation (weights dequantized to BF16, activations stay BF16). This is slower than native FP4 hardware but produces higher quality output than full W4A4 emulation.
-
-### B200 / Native FP4 GPUs
-
-| Configuration | Estimated tok/s |
-|---|---|
-| NVFP4 AWQ_FULL (native) | ~12-14 |
-| NVFP4 SVDQuant (native) | ~10-13 |
-
 ### Dense (31B) vs MoE (26B) Comparison
 
 | Metric | This Model (31B Dense) | [MoE 26B-A4B](https://github.com/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) |
 |---|---|---|
 | Active params/token | **31.3B** | ~4B |
 | NVFP4 model size | 20.45 GB | 15.3 GB |
-| Expected tok/s (DGX Spark) | ~8-12 | ~43-50 |
+| Aggregate tok/s @ 16 conc | 161 | 368 |
+| Per-request tok/s | ~11 | ~23 |
 | Quality | Higher (full dense) | Good (MoE routing) |
 | Best for | Quality-critical tasks | Speed, concurrency |
-
-The dense model reads all 31.3B parameters per token vs ~4B active for MoE, making it slower but providing higher quality from full parameter utilization.
 
 ## NVFP4 Weight Format
 
@@ -293,19 +269,19 @@ Each quantized layer stores:
 
 ### Models
 
-| Model | Type | Size | tok/s | Link |
+| Model | Type | Size | tok/s (1 req) | Link |
 |---|---|---|---|---|
-| **Gemma 4 31B DECKARD AWQ_FULL** | Dense NVFP4 | 20.5 GB | ~8-12 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4) |
-| **Gemma 4 31B DECKARD SVDQuant** | Dense NVFP4 | 20.9 GB | ~7-10 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4-SVDQuant) |
-| **Gemma 4 26B MoE Uncensored** | MoE NVFP4 | 15.3 GB | ~43-50 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) \| [GitHub](https://github.com/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) |
+| **Gemma 4 31B DECKARD AWQ_FULL** | Dense NVFP4 | 20.5 GB | ~11 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4) |
+| **Gemma 4 31B DECKARD SVDQuant** | Dense NVFP4 | 20.9 GB | ~10 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4-SVDQuant) |
+| **Gemma 4 26B MoE Uncensored** | MoE NVFP4 | 15.3 GB | ~50 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) \| [GitHub](https://github.com/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) |
 | **DFlash Qwen3.5-27B Uncensored** | Dense BF16 | 52 GB | — | [HuggingFace](https://huggingface.co/AEON-7/DFlash-Qwen3.5-27B-Uncensored) |
-| **DFlash Qwen3.5-27B Uncensored NVFP4** | Dense NVFP4 | 18.8 GB | ~15-18 | [HuggingFace](https://huggingface.co/AEON-7/DFlash-Qwen3.5-27B-Uncensored-NVFP4) |
+| **DFlash Qwen3.5-27B Uncensored NVFP4** | Dense NVFP4 | 18.8 GB | — | [HuggingFace](https://huggingface.co/AEON-7/DFlash-Qwen3.5-27B-Uncensored-NVFP4) |
 
 ### Infrastructure
 
 | Resource | Description | Link |
 |---|---|---|
-| **vLLM AWQ Container** | Patched for NVFP4_AWQ (FP8 NaN fix + W4A16 bypass) | [GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4-awq) |
+| **vLLM AWQ Container** | Patched for NVFP4_AWQ (FP8 NaN fix + pre_quant_scale) | [GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4-awq) |
 | **vLLM Base Container** | Pre-built for DGX Spark SM 12.1 (non-AWQ models) | [GHCR](https://github.com/users/AEON-7/packages/container/package/vllm-spark-gemma4-nvfp4) |
 | **Build System** | spark-vllm-docker (compile vLLM from source) | [GitHub](https://github.com/eugr/spark-vllm-docker) |
 | **Base Model** | DECKARD HERETIC (BF16) | [HuggingFace](https://huggingface.co/DavidAU/gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking) |

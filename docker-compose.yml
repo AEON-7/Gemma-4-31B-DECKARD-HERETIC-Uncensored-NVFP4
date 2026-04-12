@@ -1,5 +1,5 @@
 # Docker Compose for Gemma 4 31B DECKARD HERETIC Uncensored NVFP4 (AWQ_FULL)
-# Optimized for NVIDIA DGX Spark (GB10, SM 12.1)
+# Optimized for NVIDIA DGX Spark (GB10, SM 12.1) — uses native FP4 via FLASHINFER_CUTLASS
 #
 # Usage:
 #   1. Download model: huggingface-cli download AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4 --local-dir ./model
@@ -10,7 +10,7 @@
 #   - FP8 NaN scrubbing (ModelOpt 0.42.0 quantizer bug fix)
 #   - NVFP4_AWQ quant_algo support
 #   - AWQ pre_quant_scale handling
-#   - W4A16 emulation bypass (EMULATION backend only)
+#   - W4A16 emulation fallback (EMULATION backend only)
 
 services:
   vllm:
@@ -19,8 +19,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      # Required for DGX Spark (no fbgemm_gpu — uses W4A16 dequant bypass)
-      - VLLM_NVFP4_GEMM_BACKEND=emulation
+      # Do NOT set VLLM_NVFP4_GEMM_BACKEND — auto-selects FLASHINFER_CUTLASS on DGX Spark
       - VLLM_TEST_FORCE_FP8_MARLIN=1
       - VLLM_MARLIN_USE_ATOMIC_ADD=1
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -44,7 +43,6 @@ services:
           --max-num-seqs 16 \
           --gpu-memory-utilization 0.85 \
           --trust-remote-code \
-          --enforce-eager \
           --enable-chunked-prefill \
           --enable-prefix-caching \
           --enable-auto-tool-choice \
