@@ -1243,32 +1243,34 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # W4A16 bypass: skip emulation's input FP4 quantization,
-        # just dequantize weights and do BF16 matmul
-        from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-            dequantize_to_dtype,
-        )
-
         # Apply AWQ pre_quant_scale if present
         if getattr(layer, 'has_pre_quant_scale', False):
             x = x * layer.pre_quant_scale_runtime
 
-        weight = layer.weight
-        weight_scale = layer.weight_scale
-        weight_global_scale = layer.weight_global_scale
+        if self.backend == NvFp4LinearBackend.EMULATION:
+            # W4A16 bypass for EMULATION backend (e.g. DGX Spark):
+            # Skip emulation's input FP4 quantization (which causes
+            # quality loss), just dequantize weights and do BF16 matmul.
+            from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+                dequantize_to_dtype,
+            )
+            w_dq = dequantize_to_dtype(
+                layer.weight.data.view(torch.uint8),
+                layer.weight_scale.data,
+                layer.weight_global_scale,
+                x.dtype,
+                block_size=16,
+                swizzle=False,
+            )
+            out = torch.matmul(x, w_dq.t())
+            if bias is not None:
+                out = out + bias
+            return out
 
-        w_dq = dequantize_to_dtype(
-            weight.data.view(torch.uint8),
-            weight_scale.data,
-            weight_global_scale,
-            x.dtype,
-            block_size=16,
-            swizzle=False,
+        # All other backends: use hardware-accelerated path
+        return apply_nvfp4_linear(
+            self.backend, layer, x, bias, swizzle=self.swizzle
         )
-        out = torch.matmul(x, w_dq.t())
-        if bias is not None:
-            out = out + bias
-        return out
 
 
 class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
