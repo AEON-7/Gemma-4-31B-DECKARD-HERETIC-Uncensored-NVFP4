@@ -1,4 +1,4 @@
-# Docker Compose for Gemma 4 31B DECKARD HERETIC Uncensored NVFP4
+# Docker Compose for Gemma 4 31B DECKARD HERETIC Uncensored NVFP4 (AWQ_FULL)
 # Optimized for NVIDIA DGX Spark (GB10, SM 12.1)
 #
 # Usage:
@@ -6,11 +6,15 @@
 #   2. Update the volume path below to point to your model directory
 #   3. docker compose up -d
 #
-# Container includes patched modelopt.py with FP8 NaN fix + NVFP4_AWQ support.
+# This container includes patched modelopt.py with:
+#   - FP8 NaN scrubbing (ModelOpt 0.42.0 quantizer bug fix)
+#   - NVFP4_AWQ quant_algo support
+#   - AWQ pre_quant_scale handling
+#   - W4A16 emulation bypass (EMULATION backend only)
 
 services:
   vllm:
-    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
+    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest
     container_name: vllm-deckard-31b-nvfp4
     restart: unless-stopped
     network_mode: host
