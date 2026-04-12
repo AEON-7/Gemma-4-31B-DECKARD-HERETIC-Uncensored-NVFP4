@@ -1,0 +1,56 @@
+# Docker Compose for Gemma 4 31B DECKARD HERETIC Uncensored NVFP4
+# Optimized for NVIDIA DGX Spark (GB10, SM 12.1)
+#
+# Usage:
+#   1. Download model: huggingface-cli download AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4 --local-dir ./model
+#   2. Update the volume path below to point to your model directory
+#   3. docker compose up -d
+#
+# Container includes patched modelopt.py with FP8 NaN fix + NVFP4_AWQ support.
+
+services:
+  vllm:
+    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
+    container_name: vllm-deckard-31b-nvfp4
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Required for DGX Spark (no fbgemm_gpu — uses W4A16 dequant bypass)
+      - VLLM_NVFP4_GEMM_BACKEND=emulation
+      - VLLM_TEST_FORCE_FP8_MARLIN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - TORCH_MATMUL_PRECISION=high
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - NVIDIA_FORWARD_COMPAT=1
+    volumes:
+      # Update this path to your model directory
+      - ./model:/models/deckard
+    command:
+      - bash
+      - -c
+      - |
+        exec vllm serve /models/deckard \
+          --served-model-name deckard-31b \
+          --quantization modelopt \
+          --dtype auto \
+          --kv-cache-dtype auto \
+          --tensor-parallel-size 1 \
+          --max-model-len 4096 \
+          --max-num-seqs 16 \
+          --gpu-memory-utilization 0.85 \
+          --trust-remote-code \
+          --enforce-eager \
+          --enable-chunked-prefill \
+          --enable-prefix-caching \
+          --enable-auto-tool-choice \
+          --tool-call-parser gemma4 \
+          --reasoning-parser gemma4
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
