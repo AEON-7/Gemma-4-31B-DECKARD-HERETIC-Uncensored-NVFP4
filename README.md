@@ -67,6 +67,18 @@ Benchmarked with `ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest` on NVIDIA D
 
 Throughput scales linearly up to 16 concurrent requests (161 aggregate tok/s), saturating at 32.
 
+### With Speculative Decoding (EAGLE Drafter)
+
+Using the [DECKARD E4B NVFP4 drafter](https://huggingface.co/AEON-7/Gemma-4-E4B-DECKARD-HERETIC-Uncensored-NVFP4) (9.6 GB) with 5 speculative tokens. Benchmarked with 300 max tokens per request on DGX Spark.
+
+| Concurrent | Aggregate tok/s | Per-Request tok/s | Avg Latency (300 tok) |
+|---:|---:|---:|---:|
+| 1 | 7.6 | 8.9 | 39.4s |
+| 2 | 21.7 | 10.8 | 27.7s |
+| 4 | 42.7 | 10.7 | 28.1s |
+
+> **Note**: On the DGX Spark, the target and drafter models share the same GPU. The drafter's overhead means per-request tok/s is slightly lower than without speculative decoding. The primary benefit of spec decode is realized on multi-GPU systems where the drafter runs on a separate device, or with smaller target models where the drafter acceptance rate is higher.
+
 ## Model Details
 
 | Property | Value |
@@ -170,6 +182,60 @@ services:
             - capabilities: [gpu]
 ```
 
+### Docker Compose with Speculative Decoding (EAGLE)
+
+Uses the [DECKARD E4B drafter](https://huggingface.co/AEON-7/Gemma-4-E4B-DECKARD-HERETIC-Uncensored-NVFP4) for EAGLE-based speculative decoding. Requires three patched files: `modelopt_patched.py`, `serving_chat_patched.py`, and `eagle_patched.py`.
+
+```yaml
+services:
+  vllm:
+    image: ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4-awq:latest
+    container_name: vllm-deckard-31b-spec
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /path/to/deckard-31b-awq:/models/deckard
+      - /path/to/e4b-deckard-nvfp4:/models/e4b-drafter
+      - ./modelopt_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/modelopt.py
+      - ./serving_chat_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/chat_completion/serving.py
+      - ./eagle_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/eagle.py
+    environment:
+      - VLLM_TEST_FORCE_FP8_MARLIN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - TORCH_MATMUL_PRECISION=high
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    command:
+      - bash
+      - -c
+      - |
+        exec vllm serve /models/deckard \
+          --served-model-name deckard-31b \
+          --quantization modelopt \
+          --dtype auto \
+          --kv-cache-dtype fp8 \
+          --tensor-parallel-size 1 \
+          --max-model-len 131072 \
+          --max-num-seqs 4 \
+          --gpu-memory-utilization 0.85 \
+          --trust-remote-code \
+          --host 0.0.0.0 --port 8000 \
+          --enable-chunked-prefill \
+          --enable-prefix-caching \
+          --enable-auto-tool-choice \
+          --tool-call-parser gemma4 \
+          --reasoning-parser gemma4 \
+          --speculative-config '{"method":"draft_model","model":"/models/e4b-drafter","num_speculative_tokens":5,"quantization":"modelopt"}'
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
 ### Key Deployment Flags
 
 | Flag | Purpose |
@@ -211,6 +277,37 @@ cp modelopt_patched.py \
 3. **AWQ Pre-Quant Scale** — Registers, loads, and applies per-channel `pre_quant_scale` tensors that AWQ uses to redistribute weight magnitudes before quantization. Without this, activations are not properly scaled for the quantized weights.
 
 4. **W4A16 Emulation Fallback** — On the EMULATION backend only, bypasses input FP4 quantization and performs a W4A16 matmul (dequant weights to BF16, keep activations at full precision). All other backends use the standard hardware-accelerated path.
+
+## Speculative Decoding (EAGLE) Patches
+
+Speculative decoding with Gemma 4 requires three patches to vLLM 0.19.1. The patched files are included in this repository.
+
+### `eagle_patched.py` — Three fixes for Gemma 4 compatibility
+
+1. **Multimodal guard removal** — vLLM 0.19.1 blocks ALL multimodal targets from speculative decoding, even when the drafter is text-only. The patch removes the overly conservative `_raise_if_multimodal()` check since the downstream code already handles text-only drafters with multimodal targets correctly.
+
+2. **Gemma4 model whitelist** — Adds `Gemma4ForConditionalGeneration` to the model whitelist for `image_token_id` → `image_token_index` mapping, since Gemma 4 uses `image_token_id` (258880) but not `image_token_index`.
+
+3. **Multi-group KV cache support** — Gemma 4 uses heterogeneous attention: `head_dim=256` for sliding-window layers and `head_dim=512` for global attention layers, creating two separate KV cache groups. The spec decode framework assumed a single uniform group. The patch rewrites `initialize_attn_backend` to build a `layer_to_group` map and key attention groups by `(backend_class, kv_cache_group_id)` instead of just `backend_class`.
+
+### `serving_chat_patched.py` — Non-streaming reasoning parser fix
+
+The Gemma 4 reasoning parser relies on `<|channel>` (token 100) and `<channel|>` (token 101) delimiters to extract thinking content. With `skip_special_tokens=True` (the default), these delimiters are stripped from the decoded text, causing `extract_reasoning()` to return `None`. The patch re-decodes from `token_ids` with `skip_special_tokens=False` when text-based extraction fails.
+
+### `modelopt_patched.py` — NVFP4 AWQ support + FP8 NaN fix
+
+See [Critical Fix: FP8 NaN in Weight Scales](#critical-fix-fp8-nan-in-weight-scales) and [What the Patch Fixes](#what-the-patch-fixes) below.
+
+### Applying the Patches
+
+Mount all three patched files into the container as volume binds (shown in the [Docker Compose with Speculative Decoding](#docker-compose-with-speculative-decoding-eagle) example above), or copy them manually:
+
+```bash
+VLLM_PATH=$(python3 -c "import vllm; print(vllm.__path__[0])")
+cp eagle_patched.py    $VLLM_PATH/v1/spec_decode/eagle.py
+cp serving_chat_patched.py $VLLM_PATH/entrypoints/openai/chat_completion/serving.py
+cp modelopt_patched.py $VLLM_PATH/model_executor/layers/quantization/modelopt.py
+```
 
 ## Quantization Pipeline
 
@@ -273,6 +370,7 @@ Each quantized layer stores:
 |---|---|---|---|---|
 | **Gemma 4 31B DECKARD AWQ_FULL** | Dense NVFP4 | 20.5 GB | ~11 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4) |
 | **Gemma 4 31B DECKARD SVDQuant** | Dense NVFP4 | 20.9 GB | ~10 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4-SVDQuant) |
+| **DECKARD E4B Drafter** | EAGLE NVFP4 | 9.6 GB | — | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-E4B-DECKARD-HERETIC-Uncensored-NVFP4) \| [GitHub](https://github.com/AEON-7/Gemma-4-E4B-DECKARD-HERETIC-Uncensored-NVFP4) |
 | **Gemma 4 26B MoE Uncensored** | MoE NVFP4 | 15.3 GB | ~50 | [HuggingFace](https://huggingface.co/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) \| [GitHub](https://github.com/AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4) |
 | **DFlash Qwen3.5-27B Uncensored** | Dense BF16 | 52 GB | — | [HuggingFace](https://huggingface.co/AEON-7/DFlash-Qwen3.5-27B-Uncensored) |
 | **DFlash Qwen3.5-27B Uncensored NVFP4** | Dense NVFP4 | 18.8 GB | — | [HuggingFace](https://huggingface.co/AEON-7/DFlash-Qwen3.5-27B-Uncensored-NVFP4) |

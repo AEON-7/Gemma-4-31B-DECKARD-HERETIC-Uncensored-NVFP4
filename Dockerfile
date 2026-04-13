@@ -7,5 +7,9 @@ FROM ghcr.io/aeon-7/vllm-spark-gemma4-nvfp4:latest
 #            W4A16 bypass for EMULATION backend (dequant weights only).
 COPY modelopt_patched.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/modelopt.py
 
-LABEL org.opencontainers.image.description="vLLM 0.19.1rc1 for DGX Spark (SM 12.1) with NVFP4_AWQ patch — fixes FP8 NaN in weight_scale, adds W4A16 emulation bypass"
+# Patch non-streaming reasoning parser: re-decode with skip_special_tokens=False
+# when <|channel>/<channel|> delimiters are stripped from output.text
+COPY serving_chat_patched.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/chat_completion/serving.py
+
+LABEL org.opencontainers.image.description="vLLM 0.19.1rc1 for DGX Spark (SM 12.1) with NVFP4_AWQ patch + reasoning parser fix"
 LABEL org.opencontainers.image.source="https://github.com/AEON-7/Gemma-4-31B-DECKARD-HERETIC-Uncensored-NVFP4"
