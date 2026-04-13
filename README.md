@@ -109,8 +109,8 @@ services:
           --dtype auto \
           --kv-cache-dtype auto \
           --tensor-parallel-size 1 \
-          --max-model-len 4096 \
-          --max-num-seqs 16 \
+          --max-model-len 65536 \
+          --max-num-seqs 4 \
           --gpu-memory-utilization 0.85 \
           --trust-remote-code \
           --enable-chunked-prefill \
@@ -176,7 +176,7 @@ services:
 |---|---|
 | `--quantization modelopt` | **Required** — tells vLLM to use NVIDIA ModelOpt NVFP4 format |
 | `--kv-cache-dtype auto` | Let vLLM choose KV cache dtype (use `fp8` on B200 for 2x compression) |
-| `--max-model-len 4096` | Conservative context for 128 GB unified memory (use 131072 on B200) |
+| `--max-model-len 65536` | 64K context — conservative default for DGX Spark. Model supports up to 256K; increase with fewer concurrent sequences (use 131072 on B200) |
 | `--reasoning-parser gemma4` | Extracts `<think>` blocks for thinking/reasoning display |
 | `--tool-call-parser gemma4` | Enables native Gemma 4 function calling |
 | `--enable-chunked-prefill` | Processes long prompts in chunks to avoid OOM |
